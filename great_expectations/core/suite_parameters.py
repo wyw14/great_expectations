@@ -5,9 +5,10 @@ import datetime
 import logging
 import math
 import operator
+import re
 import traceback
 from collections import namedtuple
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple, Union
 
 import dateutil
 
@@ -377,6 +378,121 @@ def _is_single_function_no_args(parse_results: Union[ParseResults, list]) -> boo
         and isinstance(parse_results[0], tuple)
         and parse_results[0][2] is False
     )
+
+
+# Mirrors the `fnumber` token in SuiteParameterParser.get_parser().
+_NUMBER_RE = re.compile(r"[+-]?(?:\d+|\.\d+)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+# pyparsing CaselessKeyword normalizes the casing of the PI and E tokens.
+_CONSTANT_TOKENS = frozenset({"PI", "E"})
+_BINARY_OPERATOR_TOKENS = frozenset({"+", "-", "*", "/", "^"})
+
+
+class SuiteParameterExpressionVariables(NamedTuple):
+    """Result of statically analyzing a suite parameter expression.
+
+    Args:
+        variables: Variable names referenced by the expression. Function names,
+            keyword-argument names, numeric literals and the PI/E constants are
+            not included.
+        error: None when the expression could be statically analyzed, otherwise a
+            message explaining why its references cannot be determined.
+    """
+
+    variables: tuple
+    error: Optional[str]
+
+
+def extract_suite_parameter_variables(
+    parameter_expression: Any,
+) -> SuiteParameterExpressionVariables:
+    """Statically extract the variable names referenced by a suite parameter expression.
+
+    Uses the same SuiteParameterParser grammar as parse_suite_parameter but never
+    evaluates the expression: function names (e.g. ``round``), keyword-argument
+    names (e.g. ``weeks`` in ``timedelta(weeks=1)``), numeric literals, and the
+    ``PI``/``E`` constants are not reported as variables.
+
+    Args:
+        parameter_expression: A string expression, e.g. ``"my_min"`` or
+            ``"round(foo * 0.9) + 1"``.
+
+    Returns:
+        SuiteParameterExpressionVariables with the sorted, de-duplicated variable
+        names, or an error message if the expression cannot be statically parsed.
+    """
+    if not isinstance(parameter_expression, str):
+        return SuiteParameterExpressionVariables(
+            variables=(),
+            error=(
+                "Suite parameter expression must be a string, got "
+                f"{type(parameter_expression).__name__}."
+            ),
+        )
+
+    parse_results = _get_parse_results(parameter_expression)
+    if len(parse_results) > 0 and parse_results[0] == "Parse Failure":
+        err_str, err_line, err_col = parse_results[-1]
+        return SuiteParameterExpressionVariables(
+            variables=(),
+            error=f"Parse Failure: {err_str}\nStatement: {err_line}\nColumn: {err_col}",
+        )
+
+    # Snapshot the stack: _get_parse_results uses the shared module-level parser and
+    # another parse would clear it.
+    stack = list(EXPR.exprStack)
+    variables: list[str] = []
+    try:
+        _collect_variable_leaves(stack, len(stack) - 1, variables)
+    except (IndexError, ValueError):
+        # A successfully parsed expression should always produce a well-formed stack;
+        # if it does not, prefer reporting the expression as uncheckable over guessing.
+        return SuiteParameterExpressionVariables(
+            variables=(),
+            error=(
+                "Unable to statically determine the variables referenced by suite "
+                f"parameter expression {parameter_expression!r}."
+            ),
+        )
+
+    return SuiteParameterExpressionVariables(
+        variables=tuple(sorted(set(variables))),
+        error=None,
+    )
+
+
+def _collect_variable_leaves(stack: list, index: int, variables: list[str]) -> int:
+    """Walk a parsed expression stack from ``index`` toward the front, recording
+    value-leaf identifiers that represent variable references.
+
+    The stack is in push order and evaluation pops from the end. Function-call
+    tuples carry their name, number of arguments and whether the arguments are
+    keyword arguments; keyword names are pushed as plain string tokens but are
+    argument labels, not variables, and are skipped.
+
+    Returns the index immediately before the consumed subtree.
+    """
+    token = stack[index]
+    next_index = index - 1
+    if isinstance(token, tuple):
+        _fn_name, num_args, has_fn_kwargs = token
+        for _ in range(num_args):
+            next_index = _collect_variable_leaves(stack, next_index, variables)
+            if has_fn_kwargs:
+                # The token immediately before a keyword argument value is its name.
+                next_index -= 1
+    elif token == "unary -":
+        next_index = _collect_variable_leaves(stack, next_index, variables)
+    elif token in _BINARY_OPERATOR_TOKENS:
+        # Operands are pushed in order and popped in reverse, so consume right then left.
+        next_index = _collect_variable_leaves(stack, next_index, variables)
+        next_index = _collect_variable_leaves(stack, next_index, variables)
+    elif isinstance(token, str) and not _is_constant_or_number_token(token):
+        variables.append(token)
+    return next_index
+
+
+def _is_constant_or_number_token(token: str) -> bool:
+    return token in _CONSTANT_TOKENS or _NUMBER_RE.fullmatch(token) is not None
 
 
 def _deduplicate_suite_parameter_dependencies(dependencies: dict) -> dict:  # noqa: C901 #  too complex

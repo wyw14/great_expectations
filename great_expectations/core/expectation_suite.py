@@ -4,12 +4,16 @@ import json
 import logging
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     List,
+    Mapping,
     Optional,
     Sequence,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -32,6 +36,10 @@ from great_expectations.core.owner_resolution import (
     unbound_resolution_note,
 )
 from great_expectations.core.serdes import _IdentifierBundle
+from great_expectations.core.suite_parameters import (
+    extract_suite_parameter_variables,
+    is_suite_parameter,
+)
 from great_expectations.data_context.data_context.context_factory import project_manager
 from great_expectations.exceptions import (
     ExpectationSuiteError,
@@ -61,6 +69,89 @@ if TYPE_CHECKING:
     _TExpectation = TypeVar("_TExpectation", bound=Expectation)
 
 logger = logging.getLogger(__name__)
+
+
+@public_api
+@dataclass(frozen=True)
+class SuiteParameterReferenceLocation:
+    """Location of a single suite parameter reference within an ExpectationSuite.
+
+    Args:
+        expectation_index: Index of the Expectation in ExpectationSuite.expectations.
+        expectation_type: The Expectation's type, e.g. expect_column_values_to_be_between.
+        kwarg: Name of the Expectation kwarg holding the ``$PARAMETER`` expression.
+        expression: The parameter expression that was statically analyzed.
+        expectation_id: Great Expectations Cloud id of the Expectation, if present.
+    """
+
+    expectation_index: int
+    expectation_type: str
+    kwarg: str
+    expression: str
+    expectation_id: Optional[str] = None
+
+
+@public_api
+@dataclass(frozen=True)
+class SuiteParameterExpressionIssue:
+    """A ``$PARAMETER`` expression whose references could not be statically determined.
+
+    Args:
+        expectation_index: Index of the Expectation in ExpectationSuite.expectations.
+        expectation_type: The Expectation's type, e.g. expect_column_values_to_be_between.
+        kwarg: Name of the Expectation kwarg holding the ``$PARAMETER`` expression.
+        expression: The expression that could not be statically analyzed, rendered as a
+            string.
+        message: Why the expression could not be checked.
+        expectation_id: Great Expectations Cloud id of the Expectation, if present.
+    """
+
+    expectation_index: int
+    expectation_type: str
+    kwarg: str
+    expression: str
+    message: str
+    expectation_id: Optional[str] = None
+
+
+@public_api
+@dataclass(frozen=True)
+class SuiteParameterCheckResult:
+    """Result of statically checking the suite parameter references of an ExpectationSuite.
+
+    Parameter names are listed once in the summaries even when they are referenced from
+    multiple Expectations; every reference location is available in `references`.
+
+    Args:
+        provided_parameters: Referenced parameter names available after merging the
+            suite's saved suite_parameters with the runtime parameters. A parameter
+            explicitly provided as None is considered provided.
+        missing_parameters: Referenced parameter names that are not present in the
+            merged parameters and would fail at validation time.
+        unused_parameters: Parameter names present in the merged parameters but never
+            referenced by any Expectation.
+        provided_as_none_parameters: Subset of provided_parameters whose merged value is
+            explicitly None (as opposed to being absent).
+        references: Mapping of every referenced parameter name to all of its reference
+            locations, in suite order. Includes both provided and missing parameters.
+        unresolvable_references: Expressions whose referenced variables could not be
+            statically determined. The check cannot confirm that such references are
+            satisfied.
+    """
+
+    provided_parameters: Tuple[str, ...]
+    missing_parameters: Tuple[str, ...]
+    unused_parameters: Tuple[str, ...]
+    provided_as_none_parameters: Tuple[str, ...]
+    references: Mapping[str, Tuple[SuiteParameterReferenceLocation, ...]] = field(
+        default_factory=dict
+    )
+    unresolvable_references: Tuple[SuiteParameterExpressionIssue, ...] = ()
+
+    @property
+    def success(self) -> bool:
+        """True when no parameters are missing and every expression was checkable."""
+        return not self.missing_parameters and not self.unresolvable_references
 
 
 @public_api
@@ -142,6 +233,137 @@ class ExpectationSuite(SerializableDictDot):
         for expectation in self.expectations:
             output.update(expectation.suite_parameter_options)
         return tuple(sorted(output))
+
+    @public_api
+    def check_suite_parameters(
+        self,
+        runtime_parameters: Optional[Dict[str, Any]] = None,
+    ) -> SuiteParameterCheckResult:
+        """Statically check suite parameter references before loading any data.
+
+        The optional runtime parameters are merged with this suite's saved
+        ``suite_parameters`` using the same rule applied during validation: saved
+        values first, then the runtime mapping on top (so a runtime key, including
+        one explicitly set to None, overrides a saved value). Every Expectation's
+        ``$PARAMETER`` expressions are then parsed with the existing suite parameter
+        expression grammar to extract the variable names they reference.
+
+        The check does not execute any expression, load a Batch, or trigger
+        validation. It does not modify the suite or the provided runtime mapping and
+        never includes parameter values in the result.
+
+        Args:
+            runtime_parameters: Optional parameter values for this run, matching the
+                mapping passed to validation. Keys in this mapping override keys in
+                the suite's saved suite_parameters. An explicit None value counts as
+                provided; it is not the same as an absent key.
+
+        Returns:
+            SuiteParameterCheckResult: Provided, missing and unused parameter names,
+                every reference location for each referenced parameter, and any
+                expressions whose references could not be statically determined.
+        """
+        merged_parameters: Dict[str, Any] = {}
+        if self.suite_parameters:
+            merged_parameters.update(self.suite_parameters)
+        if runtime_parameters is not None:
+            merged_parameters.update(runtime_parameters)
+
+        references: Dict[str, List[SuiteParameterReferenceLocation]] = {}
+        unresolvable_references: List[SuiteParameterExpressionIssue] = []
+
+        for expectation_index, expectation in enumerate(self.expectations):
+            self._collect_suite_parameter_references(
+                expectation=expectation,
+                expectation_index=expectation_index,
+                references=references,
+                unresolvable_references=unresolvable_references,
+            )
+
+        referenced_parameter_names = set(references.keys())
+        available_parameter_names = set(merged_parameters.keys())
+        provided_parameter_names = referenced_parameter_names & available_parameter_names
+
+        result_references: Dict[str, Tuple[SuiteParameterReferenceLocation, ...]] = {
+            name: tuple(references[name]) for name in sorted(references)
+        }
+
+        return SuiteParameterCheckResult(
+            provided_parameters=tuple(sorted(provided_parameter_names)),
+            missing_parameters=tuple(
+                sorted(referenced_parameter_names - available_parameter_names)
+            ),
+            unused_parameters=tuple(sorted(available_parameter_names - referenced_parameter_names)),
+            provided_as_none_parameters=tuple(
+                sorted(name for name in provided_parameter_names if merged_parameters[name] is None)
+            ),
+            references=result_references,
+            unresolvable_references=tuple(unresolvable_references),
+        )
+
+    def _collect_suite_parameter_references(
+        self,
+        expectation: Expectation,
+        expectation_index: int,
+        references: Dict[str, List[SuiteParameterReferenceLocation]],
+        unresolvable_references: List[SuiteParameterExpressionIssue],
+    ) -> None:
+        """Walk one Expectation's kwargs and record its $PARAMETER references.
+
+        Does not execute or substitute anything.
+        """
+        for kwarg, value in expectation.configuration.kwargs.items():
+            if not is_suite_parameter(value):
+                continue
+            expression = value["$PARAMETER"]
+            # An inline temporary value ($PARAMETER.<expression>) short-circuits
+            # substitution at runtime, so the expression is neither looked up nor
+            # parsed and needs no externally provided parameter.
+            inline_value_key = f"$PARAMETER.{expression}"
+            if inline_value_key in value:
+                continue
+
+            expression_as_str = expression if isinstance(expression, str) else str(expression)
+            if not isinstance(expression, str):
+                unresolvable_references.append(
+                    SuiteParameterExpressionIssue(
+                        expectation_index=expectation_index,
+                        expectation_type=expectation.expectation_type,
+                        kwarg=kwarg,
+                        expression=expression_as_str,
+                        message=(
+                            "Suite parameter expression must be a string, got "
+                            f"{type(expression).__name__}."
+                        ),
+                        expectation_id=expectation.id,
+                    )
+                )
+                continue
+
+            extracted = extract_suite_parameter_variables(expression)
+            location = SuiteParameterReferenceLocation(
+                expectation_index=expectation_index,
+                expectation_type=expectation.expectation_type,
+                kwarg=kwarg,
+                expression=expression,
+                expectation_id=expectation.id,
+            )
+            if extracted.error is not None:
+                unresolvable_references.append(
+                    SuiteParameterExpressionIssue(
+                        expectation_index=expectation_index,
+                        expectation_type=expectation.expectation_type,
+                        kwarg=kwarg,
+                        expression=expression,
+                        message=extracted.error,
+                        expectation_id=expectation.id,
+                    )
+                )
+                continue
+            for parameter_name in extracted.variables:
+                locations = references.setdefault(parameter_name, [])
+                if location not in locations:
+                    locations.append(location)
 
     @public_api
     def add_expectation(self, expectation: _TExpectation) -> _TExpectation:
