@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 from copy import deepcopy
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Union
 
 from marshmallow import Schema, fields, post_dump, post_load, pre_dump
@@ -743,6 +745,271 @@ class ExpectationSuiteValidationResult(SerializableDictDot):
                     )
 
         return max_severity
+
+
+@public_api
+class ExpectationResultComparisonCategory(str, Enum):
+    """How a single expectation's outcome differs between two validation results.
+
+    Members:
+        ONLY_IN_OLD: The expectation ID appears only in the older result.
+        ONLY_IN_NEW: The expectation ID appears only in the newer result.
+        SUCCESS_TO_FAILURE: The expectation succeeded in the old result and
+            fails in the new one (a new failure).
+        FAILURE_TO_SUCCESS: The expectation failed in the old result and
+            succeeds in the new one (a recovery).
+        UNCHANGED: Both results report the same `success` value under
+            success-equivalent configurations.
+        UNKNOWN: At least one side does not report a `success` value (it is
+            None), so no transition can be determined.
+        CONFIG_CHANGED: The same ID carries configurations that are not
+            success-equivalent; the condition deciding success changed, so the
+            status difference must not be read as a data regression.
+    """
+
+    ONLY_IN_OLD = "only_in_old"
+    ONLY_IN_NEW = "only_in_new"
+    SUCCESS_TO_FAILURE = "success_to_failure"
+    FAILURE_TO_SUCCESS = "failure_to_success"
+    UNCHANGED = "unchanged"
+    UNKNOWN = "unknown"
+    CONFIG_CHANGED = "config_changed"
+
+
+@public_api
+@dataclass(frozen=True)
+class ExpectationResultComparison:
+    """One expectation's status difference between two validation results.
+
+    Only identifying and status information is carried: result payloads,
+    `unexpected_rows`, exception tracebacks, and other validation data are not
+    copied from either input.
+
+    Args:
+        expectation_id: The non-null expectation ID used as the match key.
+        category: The kind of difference observed.
+        old_success: `success` in the older result, or None if the ID is absent
+            there.
+        new_success: `success` in the newer result, or None if the ID is absent
+            there.
+    """
+
+    expectation_id: str
+    category: ExpectationResultComparisonCategory
+    old_success: Optional[bool]
+    new_success: Optional[bool]
+
+
+@public_api
+@dataclass(frozen=True)
+class ExpectationSuiteValidationResultComparison:
+    """Item-by-item comparison of two ExpectationSuiteValidationResults.
+
+    Args:
+        items: One ExpectationResultComparison per expectation ID, sorted
+            stably by expectation ID.
+    """
+
+    items: List[ExpectationResultComparison]
+
+    def by_category(
+        self,
+    ) -> dict[ExpectationResultComparisonCategory, List[ExpectationResultComparison]]:
+        """Return the comparison items grouped by category, in ID-sorted order.
+
+        Every category is present as a key, with an empty list when no item was
+        classified into it.
+        """
+        grouped: dict[
+            ExpectationResultComparisonCategory,
+            list[ExpectationResultComparison],
+        ] = {category: [] for category in ExpectationResultComparisonCategory}
+        for item in self.items:
+            grouped[item.category].append(item)
+        return grouped
+
+
+@public_api
+def compare_suite_validation_results(
+    old_result: ExpectationSuiteValidationResult,
+    new_result: ExpectationSuiteValidationResult,
+) -> ExpectationSuiteValidationResultComparison:
+    """Compare two ExpectationSuiteValidationResults item by item.
+
+    Individual expectation results are matched on the non-null `id` of their
+    `expectation_config`, never by their position in the results list. Each ID
+    is reported once, and the returned items are sorted stably by ID. Each item
+    carries only the expectation ID, its category, and the two `success`
+    values; result payloads, `unexpected_rows`, and exception information are
+    not copied.
+
+    Each pair matched by ID is classified as follows:
+
+    - `SUCCESS_TO_FAILURE`: succeeded in the old result, failed in the new one.
+    - `FAILURE_TO_SUCCESS`: failed in the old result, succeeded in the new one.
+    - `UNCHANGED`: both sides report the same `success` value.
+    - `UNKNOWN`: either side's `success` is None, so no transition is known.
+    - `CONFIG_CHANGED`: the two configurations are not equivalent at the
+      `success` match level. The pair is reported as a configuration change
+      rather than a data regression or recovery, because the condition that
+      decides success is not the same. Equivalence follows
+      `ExpectationConfiguration.isEquivalentTo` with `match_type="success"`,
+      the same rule used when comparing ExpectationValidationResults; changes
+      that do not affect the success condition (e.g. meta-only edits) are not
+      treated as configuration changes.
+
+    IDs found on only one side are classified `ONLY_IN_OLD` or `ONLY_IN_NEW`.
+
+    Note:
+        This comparison only describes the two existing result sets. The
+        results may have been produced against different batches or with
+        different suite configurations, so a status difference by itself cannot
+        prove a data root cause. No validation is run, and neither input is
+        modified.
+
+    Args:
+        old_result: The earlier ExpectationSuiteValidationResult.
+        new_result: The later ExpectationSuiteValidationResult.
+
+    Returns:
+        The per-ID comparison, sorted by expectation ID.
+
+    Raises:
+        ExpectationSuiteValidationResultComparisonError: If either result
+            contains an expectation result without a non-null expectation ID,
+            or contains the same expectation ID more than once.
+    """
+    old_by_id, old_problems = _index_results_by_expectation_id(old_result, "old")
+    new_by_id, new_problems = _index_results_by_expectation_id(new_result, "new")
+    problems = old_problems + new_problems
+    if problems:
+        raise gx_exceptions.ExpectationSuiteValidationResultComparisonError(
+            "Cannot compare ExpectationSuiteValidationResults by expectation ID: "
+            + "; ".join(problems)
+            + ". Results are matched only by non-null expectation ID, never by "
+            "list position."
+        )
+
+    items: list[ExpectationResultComparison] = []
+    for expectation_id in sorted(set(old_by_id) | set(new_by_id)):
+        old_item = old_by_id.get(expectation_id)
+        new_item = new_by_id.get(expectation_id)
+        if old_item is not None and new_item is not None:
+            category = _classify_matched_pair(old_item, new_item)
+            old_success = old_item.success
+            new_success = new_item.success
+        elif new_item is not None:
+            category = ExpectationResultComparisonCategory.ONLY_IN_NEW
+            old_success = None
+            new_success = new_item.success
+        else:
+            category = ExpectationResultComparisonCategory.ONLY_IN_OLD
+            old_success = old_item.success if old_item is not None else None
+            new_success = None
+
+        items.append(
+            ExpectationResultComparison(
+                expectation_id=expectation_id,
+                category=category,
+                old_success=old_success,
+                new_success=new_success,
+            )
+        )
+
+    return ExpectationSuiteValidationResultComparison(items=items)
+
+
+def _classify_matched_pair(
+    old_item: ExpectationValidationResult,
+    new_item: ExpectationValidationResult,
+) -> ExpectationResultComparisonCategory:
+    """Classify two results sharing an expectation ID."""
+    old_success = old_item.success
+    new_success = new_item.success
+    if not _expectation_configs_are_equivalent(
+        old_item.expectation_config,
+        new_item.expectation_config,
+        match_type="success",
+    ):
+        return ExpectationResultComparisonCategory.CONFIG_CHANGED
+    if old_success is None or new_success is None:
+        return ExpectationResultComparisonCategory.UNKNOWN
+    if old_success == new_success:
+        return ExpectationResultComparisonCategory.UNCHANGED
+    if old_success is True and new_success is False:
+        return ExpectationResultComparisonCategory.SUCCESS_TO_FAILURE
+    return ExpectationResultComparisonCategory.FAILURE_TO_SUCCESS
+
+
+def _index_results_by_expectation_id(
+    suite_result: ExpectationSuiteValidationResult, side: str
+) -> tuple[dict[str, ExpectationValidationResult], list[str]]:
+    """Index one suite result's individual results by non-null expectation ID.
+
+    Returns the ID-to-result mapping alongside human-readable descriptions of
+    any missing or duplicate IDs that make the side ambiguous to match.
+    """
+    by_id: dict[str, ExpectationValidationResult] = {}
+    first_index_by_id: dict[str, int] = {}
+    duplicate_indices: dict[str, list[int]] = {}
+    missing_indices: list[int] = []
+
+    for index, result in enumerate(suite_result.results):
+        expectation_id = _get_expectation_id(result.expectation_config)
+        if expectation_id is None:
+            missing_indices.append(index)
+        elif expectation_id in by_id:
+            if expectation_id not in duplicate_indices:
+                duplicate_indices[expectation_id] = [first_index_by_id[expectation_id]]
+            duplicate_indices[expectation_id].append(index)
+        else:
+            by_id[expectation_id] = result
+            first_index_by_id[expectation_id] = index
+
+    problems: list[str] = []
+    if missing_indices:
+        problems.append(
+            f"the {side} result has expectation result(s) without a non-null "
+            f"expectation ID at indices {missing_indices}"
+        )
+    if duplicate_indices:
+        details = ", ".join(
+            f"{expectation_id!r} at indices {indices}"
+            for expectation_id, indices in sorted(duplicate_indices.items())
+        )
+        problems.append(f"the {side} result contains duplicate expectation ID(s): {details}")
+    return by_id, problems
+
+
+def _get_expectation_id(
+    expectation_config: Union[ExpectationConfiguration, dict, None],
+) -> Optional[str]:
+    """Return the non-empty expectation ID of a result's config in either form.
+
+    A result stores `expectation_config` as given, so it can be an
+    ExpectationConfiguration or a plain dict (or None). None and empty strings
+    do not provide a usable match key.
+    """
+    from great_expectations.expectations.expectation_configuration import (
+        ExpectationConfiguration,
+    )
+
+    if expectation_config is None:
+        return None
+    if isinstance(expectation_config, ExpectationConfiguration):
+        expectation_id = expectation_config.id
+    elif isinstance(expectation_config, dict):
+        expectation_id = expectation_config.get("id")
+    else:
+        raise gx_exceptions.ExpectationSuiteValidationResultComparisonError(  # noqa: TRY003 # FIXME CoP
+            "Cannot read expectation ID from expectation_config of type "
+            f"{type(expectation_config).__name__}; expected an "
+            "ExpectationConfiguration or dict."
+        )
+    if expectation_id is None:
+        return None
+    expectation_id = str(expectation_id)
+    return expectation_id if expectation_id.strip() else None
 
 
 class ExpectationSuiteValidationResultSchema(Schema):

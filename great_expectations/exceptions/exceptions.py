@@ -226,6 +226,16 @@ class ExpectationNotFoundError(GreatExpectationsError):
     pass
 
 
+class ExpectationSuiteValidationResultComparisonError(GreatExpectationsError):
+    """Raised when two ExpectationSuiteValidationResults cannot be compared.
+
+    Individual results are matched on their non-null expectation IDs, so a
+    missing or duplicate expectation ID on either side makes matching
+    ambiguous and comparison impossible; results are never matched by their
+    position in the results list.
+    """
+
+
 class GreatExpectationsTypeError(TypeError):
     pass
 

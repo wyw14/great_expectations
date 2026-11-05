@@ -7,10 +7,14 @@ from .expectation_suite import (
     expectationSuiteSchema,
 )
 from .expectation_validation_result import (
+    ExpectationResultComparison,
+    ExpectationResultComparisonCategory,
     ExpectationSuiteValidationResult,
+    ExpectationSuiteValidationResultComparison,
     ExpectationSuiteValidationResultSchema,
     ExpectationValidationResult,
     ExpectationValidationResultSchema,
+    compare_suite_validation_results,
     expectationSuiteValidationResultSchema,
     expectationValidationResultSchema,
     get_metric_kwargs_id,
@@ -22,9 +26,12 @@ from .validation_definition import ValidationDefinition
 
 __all__ = [
     "Domain",
+    "ExpectationResultComparison",
+    "ExpectationResultComparisonCategory",
     "ExpectationSuite",
     "ExpectationSuiteSchema",
     "ExpectationSuiteValidationResult",
+    "ExpectationSuiteValidationResultComparison",
     "ExpectationSuiteValidationResultSchema",
     "ExpectationValidationResult",
     "ExpectationValidationResultSchema",
@@ -32,6 +39,7 @@ __all__ = [
     "RunIdentifier",
     "RunIdentifierSchema",
     "ValidationDefinition",
+    "compare_suite_validation_results",
     "expectationSuiteSchema",
     "expectationSuiteValidationResultSchema",
     "expectationValidationResultSchema",

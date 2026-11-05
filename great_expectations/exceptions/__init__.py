@@ -20,6 +20,7 @@ from .exceptions import (
     ExpectationNotFoundError,
     ExpectationSuiteError,
     ExpectationSuiteNotFoundError,
+    ExpectationSuiteValidationResultComparisonError,
     GitIgnoreScaffoldingError,
     GreatExpectationsError,
     GreatExpectationsTypeError,

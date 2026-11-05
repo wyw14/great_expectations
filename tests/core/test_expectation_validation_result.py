@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from typing import Any, cast
 
 import pandas as pd
@@ -8,8 +9,12 @@ import pytest
 
 import great_expectations.expectations as gxe
 from great_expectations.core import (
+    ExpectationResultComparison,
+    ExpectationResultComparisonCategory,
     ExpectationSuiteValidationResult,
+    ExpectationSuiteValidationResultComparison,
     ExpectationValidationResult,
+    compare_suite_validation_results,
 )
 from great_expectations.core.batch import BatchMarkers, LegacyBatchDefinition
 from great_expectations.core.expectation_validation_result import (
@@ -17,6 +22,9 @@ from great_expectations.core.expectation_validation_result import (
 )
 from great_expectations.core.id_dict import BatchSpec, IDDict
 from great_expectations.core.run_identifier import RunIdentifier
+from great_expectations.exceptions import (
+    ExpectationSuiteValidationResultComparisonError,
+)
 from great_expectations.expectations.expectation_configuration import (
     ExpectationConfiguration,
 )
@@ -1113,3 +1121,411 @@ def test_a_dict_config_that_loads_is_equivalent_to_its_configuration_in_either_o
     assert as_dict == configured
     assert not (configured != as_dict)
     assert not (as_dict != configured)
+
+
+def _evr(
+    expectation_id: str | None,
+    success: bool | None,
+    *,
+    column: str = "shared_column",
+    expectation_type: str = "expect_column_to_exist",
+    kwargs: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
+    expectation_config: Any = None,
+) -> ExpectationValidationResult:
+    """Build an individual result, deliberately carrying sensitive payloads that
+    a comparison must never copy."""
+    if expectation_config is None:
+        expectation_config = ExpectationConfiguration(
+            type=expectation_type,
+            kwargs=kwargs if kwargs is not None else {"column": column},
+            meta=meta if meta is not None else {},
+            id=expectation_id,
+        )
+    return ExpectationValidationResult(
+        success=success,
+        expectation_config=expectation_config,
+        result={
+            "unexpected_count": 1,
+            "unexpected_rows": [{"id": "do-not-copy-row"}],
+        },
+        exception_info={
+            "raised_exception": True,
+            "exception_traceback": "do-not-copy-traceback",
+            "exception_message": "do-not-copy-message",
+        },
+    )
+
+
+def _suite(
+    results: list[ExpectationValidationResult],
+) -> ExpectationSuiteValidationResult:
+    return ExpectationSuiteValidationResult(
+        success=all(result.success is True for result in results),
+        results=results,
+        suite_name="suite",
+    )
+
+
+class TestCompareSuiteValidationResults:
+    @pytest.mark.unit
+    def test_matches_by_id_across_reorder_and_reports_every_category(self) -> None:
+        old_result = _suite(
+            [
+                _evr("a", True),
+                _evr("b", False),
+                _evr("c", True),
+                _evr("d", False),
+                _evr("e", True, column="column_e"),
+                _evr("g", True),
+                _evr("h", None),
+                _evr("i", True, meta={"version": 1}),
+            ]
+        )
+        # The new result is deliberately in a different order and mixes in
+        # additions, removals, status flips, unknown statuses and a config edit.
+        new_result = _suite(
+            [
+                _evr("i", True, meta={"version": 2}),
+                _evr("h", True),
+                _evr("f", True),
+                _evr("e", False, column="column_e_renamed"),
+                _evr("d", None),
+                _evr("c", False),
+                _evr("b", True),
+                _evr("a", True),
+            ]
+        )
+
+        comparison = compare_suite_validation_results(old_result, new_result)
+
+        assert comparison.items == [
+            ExpectationResultComparison(
+                "a", ExpectationResultComparisonCategory.UNCHANGED, True, True
+            ),
+            ExpectationResultComparison(
+                "b", ExpectationResultComparisonCategory.FAILURE_TO_SUCCESS, False, True
+            ),
+            ExpectationResultComparison(
+                "c", ExpectationResultComparisonCategory.SUCCESS_TO_FAILURE, True, False
+            ),
+            ExpectationResultComparison(
+                "d", ExpectationResultComparisonCategory.UNKNOWN, False, None
+            ),
+            ExpectationResultComparison(
+                "e", ExpectationResultComparisonCategory.CONFIG_CHANGED, True, False
+            ),
+            ExpectationResultComparison(
+                "f", ExpectationResultComparisonCategory.ONLY_IN_NEW, None, True
+            ),
+            ExpectationResultComparison(
+                "g", ExpectationResultComparisonCategory.ONLY_IN_OLD, True, None
+            ),
+            ExpectationResultComparison(
+                "h", ExpectationResultComparisonCategory.UNKNOWN, None, True
+            ),
+            ExpectationResultComparison(
+                "i", ExpectationResultComparisonCategory.UNCHANGED, True, True
+            ),
+        ]
+
+        grouped = comparison.by_category()
+        assert {
+            item.expectation_id
+            for item in grouped[ExpectationResultComparisonCategory.SUCCESS_TO_FAILURE]
+        } == {"c"}
+        assert {
+            item.expectation_id
+            for item in grouped[ExpectationResultComparisonCategory.FAILURE_TO_SUCCESS]
+        } == {"b"}
+        assert {
+            item.expectation_id
+            for item in grouped[ExpectationResultComparisonCategory.CONFIG_CHANGED]
+        } == {"e"}
+        assert {
+            item.expectation_id for item in grouped[ExpectationResultComparisonCategory.UNKNOWN]
+        } == {"d", "h"}
+        assert {
+            item.expectation_id for item in grouped[ExpectationResultComparisonCategory.ONLY_IN_NEW]
+        } == {"f"}
+        assert {
+            item.expectation_id for item in grouped[ExpectationResultComparisonCategory.ONLY_IN_OLD]
+        } == {"g"}
+        assert {
+            item.expectation_id for item in grouped[ExpectationResultComparisonCategory.UNCHANGED]
+        } == {"a", "i"}
+
+    @pytest.mark.unit
+    def test_items_are_sorted_by_id_independent_of_input_order(self) -> None:
+        old_ids = ["z", "a", "m", "b"]
+        new_ids = ["m", "b", "z", "a"]  # same IDs, different positions
+
+        comparison = compare_suite_validation_results(
+            _suite([_evr(expectation_id, True) for expectation_id in old_ids]),
+            _suite([_evr(expectation_id, True) for expectation_id in new_ids]),
+        )
+
+        assert [item.expectation_id for item in comparison.items] == ["a", "b", "m", "z"]
+        assert all(
+            item.category == ExpectationResultComparisonCategory.UNCHANGED
+            for item in comparison.items
+        )
+
+    @pytest.mark.unit
+    def test_output_carries_only_identifier_category_and_status(self) -> None:
+        old_result = _suite([_evr("a", True), _evr("b", False)])
+        new_result = _suite([_evr("a", False), _evr("b", False)])
+
+        comparison = compare_suite_validation_results(old_result, new_result)
+
+        assert [field.name for field in fields(ExpectationResultComparison)] == [
+            "expectation_id",
+            "category",
+            "old_success",
+            "new_success",
+        ]
+        rendered = repr(comparison)
+        assert "do-not-copy" not in rendered
+        assert "unexpected_rows" not in rendered
+
+    @pytest.mark.unit
+    def test_config_change_takes_precedence_over_status_transition(self) -> None:
+        # A status flip must be called a config change, not a data regression,
+        # when the success-determining configuration differs.
+        old_result = _suite(
+            [
+                _evr("regressed-looking", True, column="before"),
+                _evr("unchanged-looking", True, column="before"),
+                _evr("unknown-looking", None, column="before"),
+            ]
+        )
+        new_result = _suite(
+            [
+                _evr("regressed-looking", False, column="after"),
+                _evr("unchanged-looking", True, column="after"),
+                _evr("unknown-looking", True, column="after"),
+            ]
+        )
+
+        comparison = compare_suite_validation_results(old_result, new_result)
+
+        assert comparison.items == [
+            ExpectationResultComparison(
+                "regressed-looking",
+                ExpectationResultComparisonCategory.CONFIG_CHANGED,
+                True,
+                False,
+            ),
+            ExpectationResultComparison(
+                "unchanged-looking",
+                ExpectationResultComparisonCategory.CONFIG_CHANGED,
+                True,
+                True,
+            ),
+            ExpectationResultComparison(
+                "unknown-looking",
+                ExpectationResultComparisonCategory.CONFIG_CHANGED,
+                None,
+                True,
+            ),
+        ]
+
+    @pytest.mark.unit
+    def test_success_level_equivalence_ignores_meta_and_runtime_kwargs(self) -> None:
+        # Meta-only and result_format-only differences do not decide success, so
+        # they must not be reported as configuration changes.
+        old_result = _suite(
+            [
+                _evr("meta", True, meta={"version": 1}),
+                _evr(
+                    "runtime",
+                    True,
+                    kwargs={"column": "shared_column", "result_format": "BASIC"},
+                ),
+            ]
+        )
+        new_result = _suite(
+            [
+                _evr("meta", True, meta={"version": 2, "notes": "changed"}),
+                _evr(
+                    "runtime",
+                    True,
+                    kwargs={"column": "shared_column", "result_format": "COMPLETE"},
+                ),
+            ]
+        )
+
+        comparison = compare_suite_validation_results(old_result, new_result)
+
+        assert [item.category for item in comparison.items] == [
+            ExpectationResultComparisonCategory.UNCHANGED,
+            ExpectationResultComparisonCategory.UNCHANGED,
+        ]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("old_success", "new_success"),
+        [
+            pytest.param(None, True, id="old-unknown"),
+            pytest.param(False, None, id="new-unknown"),
+            pytest.param(None, None, id="both-unknown"),
+        ],
+    )
+    def test_unknown_when_either_success_is_none(
+        self, old_success: bool | None, new_success: bool | None
+    ) -> None:
+        comparison = compare_suite_validation_results(
+            _suite([_evr("a", old_success)]),
+            _suite([_evr("a", new_success)]),
+        )
+
+        assert comparison.items == [
+            ExpectationResultComparison(
+                "a",
+                ExpectationResultComparisonCategory.UNKNOWN,
+                old_success,
+                new_success,
+            )
+        ]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "missing_config",
+        [
+            pytest.param(None, id="no-expectation-config"),
+            pytest.param(
+                ExpectationConfiguration(
+                    type="expect_column_to_exist", kwargs={"column": "x"}, id=None
+                ),
+                id="none-id",
+            ),
+            pytest.param(
+                ExpectationConfiguration(
+                    type="expect_column_to_exist", kwargs={"column": "x"}, id=""
+                ),
+                id="empty-id",
+            ),
+        ],
+    )
+    def test_rejects_results_without_a_non_null_id(self, missing_config: Any) -> None:
+        # The unidentifiable result is sandwiched between keyed ones so its index
+        # is reported rather than guessed by position.
+        old_result = _suite([_evr("a", True), _evr(None, True, expectation_config=missing_config)])
+        new_result = _suite([_evr("a", True)])
+
+        with pytest.raises(ExpectationSuiteValidationResultComparisonError) as exc_info:
+            compare_suite_validation_results(old_result, new_result)
+
+        message = str(exc_info.value)
+        assert "old" in message
+        assert "indices [1]" in message
+        assert "never by list position" in message
+
+    @pytest.mark.unit
+    def test_rejects_an_unreadable_expectation_config(self) -> None:
+        old_result = _suite(
+            [_evr("a", True, expectation_config=cast("ExpectationConfiguration", object()))]
+        )
+        new_result = _suite([_evr("a", True)])
+
+        with pytest.raises(ExpectationSuiteValidationResultComparisonError) as exc_info:
+            compare_suite_validation_results(old_result, new_result)
+
+        assert "expected an ExpectationConfiguration or dict" in str(exc_info.value)
+
+    @pytest.mark.unit
+    def test_rejects_duplicate_ids_and_names_side_id_and_indices(self) -> None:
+        old_result = _suite([_evr("dup", True), _evr("other", True), _evr("dup", False)])
+        new_result = _suite([_evr("dup", True)])
+
+        with pytest.raises(ExpectationSuiteValidationResultComparisonError) as exc_info:
+            compare_suite_validation_results(old_result, new_result)
+
+        message = str(exc_info.value)
+        assert "old" in message
+        assert "'dup' at indices [0, 2]" in message
+
+    @pytest.mark.unit
+    def test_reports_problems_from_both_sides_together(self) -> None:
+        old_result = _suite([_evr("dup", True), _evr("dup", False)])
+        new_result = _suite([_evr("unique", True), _evr(None, True, expectation_config=None)])
+
+        with pytest.raises(ExpectationSuiteValidationResultComparisonError) as exc_info:
+            compare_suite_validation_results(old_result, new_result)
+
+        message = str(exc_info.value)
+        assert "old result contains duplicate expectation ID(s)" in message
+        assert "new result has expectation result(s) without a non-null expectation ID" in message
+
+    @pytest.mark.unit
+    def test_does_not_modify_inputs(self) -> None:
+        old_result = _suite([_evr("a", True), _evr("b", False)])
+        new_result = _suite([_evr("a", False), _evr("b", False), _evr("c", True)])
+        old_before = old_result.to_json_dict()
+        new_before = new_result.to_json_dict()
+
+        compare_suite_validation_results(old_result, new_result)
+
+        assert old_result.to_json_dict() == old_before
+        assert new_result.to_json_dict() == new_before
+
+    @pytest.mark.unit
+    def test_supports_plain_dict_configs_in_either_operand_order(self) -> None:
+        # A schema-loaded config id must be a UUID, as it is in serialized results.
+        mixed_id = "22222222-2222-2222-2222-222222222222"
+        dict_config_old = _dict_config(
+            {"type": "expect_column_to_exist", "kwargs": {"column": "d"}, "id": "dict-pair"}
+        )
+        dict_config_changed = _dict_config(
+            {"type": "expect_column_to_exist", "kwargs": {"column": "e"}, "id": "dict-pair"}
+        )
+
+        old_result = _suite(
+            [
+                _evr("dict-pair", True, expectation_config=dict_config_old),
+                _evr(
+                    mixed_id,
+                    True,
+                    expectation_config=_dict_config(
+                        {
+                            "type": "expect_column_to_exist",
+                            "kwargs": {"column": "m"},
+                            "id": mixed_id,
+                        }
+                    ),
+                ),
+            ]
+        )
+        new_result = _suite(
+            [
+                _evr("dict-pair", False, expectation_config=dict_config_changed),
+                _evr(mixed_id, True, column="m"),
+            ]
+        )
+
+        comparison = compare_suite_validation_results(old_result, new_result)
+
+        assert comparison.items == [
+            ExpectationResultComparison(
+                mixed_id,
+                ExpectationResultComparisonCategory.UNCHANGED,
+                True,
+                True,
+            ),
+            ExpectationResultComparison(
+                "dict-pair",
+                ExpectationResultComparisonCategory.CONFIG_CHANGED,
+                True,
+                False,
+            ),
+        ]
+
+    @pytest.mark.unit
+    def test_empty_suites_compare_to_nothing(self) -> None:
+        comparison = compare_suite_validation_results(_suite([]), _suite([]))
+
+        assert isinstance(comparison, ExpectationSuiteValidationResultComparison)
+        assert comparison.items == []
+        assert comparison.by_category() == {
+            category: [] for category in ExpectationResultComparisonCategory
+        }
