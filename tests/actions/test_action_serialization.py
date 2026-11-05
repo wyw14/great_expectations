@@ -55,6 +55,8 @@ class TestActionSerialization:
     SERIALIZED_ACTIONS = {
         SlackNotificationAction: {
             "name": "my_slack_action",
+            "min_failed_validation_ratio": None,
+            "min_failed_validations": None,
             "notify_on": "all",
             "notify_with": None,
             "renderer": {
@@ -69,6 +71,8 @@ class TestActionSerialization:
         },
         MicrosoftTeamsNotificationAction: {
             "name": "my_teams_action",
+            "min_failed_validation_ratio": None,
+            "min_failed_validations": None,
             "notify_on": "all",
             "renderer": {
                 "class_name": "MicrosoftTeamsRenderer",
@@ -92,6 +96,8 @@ class TestActionSerialization:
         },
         EmailAction: {
             "name": "my_email_action",
+            "min_failed_validation_ratio": None,
+            "min_failed_validations": None,
             "notify_on": "all",
             "notify_with": None,
             "receiver_emails": EXAMPLE_EMAILS,
@@ -157,3 +163,17 @@ class TestActionSerialization:
     ):
         actual = action_class.parse_obj(serialized_action)
         assert isinstance(actual, action_class)
+
+    @pytest.mark.unit
+    def test_failure_thresholds_serialize_and_deserialize(self):
+        action = SlackNotificationAction(
+            name="my_slack_action",
+            slack_webhook=self.EXAMPLE_SLACK_WEBHOOK,
+            min_failed_validations=2,
+            min_failed_validation_ratio=0.5,
+        )
+
+        restored = SlackNotificationAction.parse_raw(action.json())
+
+        assert restored.min_failed_validations == 2
+        assert restored.min_failed_validation_ratio == 0.5

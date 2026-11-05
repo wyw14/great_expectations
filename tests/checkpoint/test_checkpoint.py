@@ -241,6 +241,8 @@ class TestCheckpointSerialization:
                 [
                     {
                         "name": "my_slack_action",
+                        "min_failed_validation_ratio": None,
+                        "min_failed_validations": None,
                         "notify_on": "all",
                         "notify_with": None,
                         "renderer": {
@@ -255,6 +257,8 @@ class TestCheckpointSerialization:
                     },
                     {
                         "name": "my_teams_action",
+                        "min_failed_validation_ratio": None,
+                        "min_failed_validations": None,
                         "notify_on": "all",
                         "renderer": {
                             "class_name": "MicrosoftTeamsRenderer",
@@ -364,6 +368,8 @@ class TestCheckpointSerialization:
             "actions": [
                 {
                     "name": "my_slack_action",
+                    "min_failed_validation_ratio": None,
+                    "min_failed_validations": None,
                     "notify_on": "all",
                     "notify_with": None,
                     "renderer": {
@@ -378,6 +384,8 @@ class TestCheckpointSerialization:
                 },
                 {
                     "name": "my_teams_action",
+                    "min_failed_validation_ratio": None,
+                    "min_failed_validations": None,
                     "notify_on": "all",
                     "renderer": {
                         "class_name": "MicrosoftTeamsRenderer",

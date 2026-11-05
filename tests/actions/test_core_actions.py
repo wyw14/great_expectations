@@ -28,6 +28,7 @@ from great_expectations.checkpoint.actions import (
     should_notify,
 )
 from great_expectations.checkpoint.checkpoint import Checkpoint, CheckpointResult
+from great_expectations.compatibility.pydantic import ValidationError
 from great_expectations.core.batch import IDDict, LegacyBatchDefinition
 from great_expectations.core.expectation_validation_result import (
     ExpectationSuiteValidationResult,
@@ -205,6 +206,70 @@ def checkpoint_result_with_assets(mocker: MockerFixture):
         },
         checkpoint_config=mocker.Mock(spec=Checkpoint, name="my_checkpoint"),
     )
+
+
+@pytest.fixture
+def mixed_checkpoint_result_factory(mocker: MockerFixture):
+    """Build a CheckpointResult with the requested numbers of passing/failing VDs.
+
+    Each run result stands for one executed Validation Definition. Failing VDs report
+    ``evaluated_expectations_when_failed`` evaluated Expectations so tests can prove the
+    threshold counts Validation Definitions rather than individual Expectations.
+    """
+
+    def _factory(
+        num_success: int,
+        num_failed: int,
+        evaluated_expectations_when_failed: int = 1,
+    ) -> CheckpointResult:
+        run_results: dict[ValidationResultIdentifier, ExpectationSuiteValidationResult] = {}
+
+        for i in range(num_success):
+            suite_name = f"passing_suite_{i}"
+            run_results[
+                ValidationResultIdentifier(
+                    expectation_suite_identifier=ExpectationSuiteIdentifier(name=suite_name),
+                    run_id=RunIdentifier(run_name="prod_20240401"),
+                    batch_identifier=f"batch_pass_{i}",
+                )
+            ] = ExpectationSuiteValidationResult(
+                success=True,
+                statistics={"successful_expectations": 1, "evaluated_expectations": 1},
+                results=[],
+                suite_name=suite_name,
+            )
+
+        for i in range(num_failed):
+            suite_name = f"failing_suite_{i}"
+            run_results[
+                ValidationResultIdentifier(
+                    expectation_suite_identifier=ExpectationSuiteIdentifier(name=suite_name),
+                    run_id=RunIdentifier(run_name="prod_20240401"),
+                    batch_identifier=f"batch_fail_{i}",
+                )
+            ] = ExpectationSuiteValidationResult(
+                success=False,
+                statistics={
+                    "successful_expectations": 0,
+                    "evaluated_expectations": evaluated_expectations_when_failed,
+                },
+                results=[],
+                suite_name=suite_name,
+            )
+
+        return CheckpointResult(
+            run_id=RunIdentifier(run_time=utc_datetime),
+            run_results=run_results,
+            checkpoint_config=Checkpoint(
+                name="mixed-checkpoint",
+                validation_definitions=[
+                    mocker.MagicMock(spec=ValidationDefinition)
+                    for _ in range(num_success + num_failed)
+                ],
+            ),
+        )
+
+    return _factory
 
 
 @contextmanager
@@ -1099,3 +1164,320 @@ class TestShouldNotify:
     )
     def test_severity_modes_on_failure_with_none_max(self, notify_on: NotifyOn):
         assert should_notify(success=False, notify_on=notify_on, max_severity=None) is False
+
+
+def _make_slack_action(**kwargs):
+    return SlackNotificationAction(
+        name="slack_action", slack_webhook="https://example.com/slack", **kwargs
+    )
+
+
+def _make_teams_action(**kwargs):
+    return MicrosoftTeamsNotificationAction(
+        name="teams_action", teams_webhook="https://example.com/teams", **kwargs
+    )
+
+
+def _make_email_action(**kwargs):
+    return EmailAction(
+        name="email_action",
+        smtp_address="smtp.example.com",
+        smtp_port="587",
+        receiver_emails="ops@example.com",
+        **kwargs,
+    )
+
+
+# (factory, channel id, action result key, value when notify_on does not match)
+_NOTIFICATION_CHANNELS = [
+    pytest.param(
+        _make_slack_action,
+        "slack",
+        "slack_notification_result",
+        "none required",
+        id="slack",
+    ),
+    pytest.param(
+        _make_teams_action,
+        "teams",
+        "microsoft_teams_notification_result",
+        None,
+        id="teams",
+    ),
+    pytest.param(
+        _make_email_action,
+        "email",
+        "email_result",
+        "",
+        id="email",
+    ),
+]
+
+
+class TestNotificationFailureThresholds:
+    """Slack, Teams and email actions gate on failed Validation Definition counts/ratios."""
+
+    @staticmethod
+    def _run_action(
+        mocker: MockerFixture,
+        mock_context,
+        channel: str,
+        action: ValidationAction,
+        checkpoint_result: CheckpointResult,
+    ):
+        mock_context.get_docs_sites_urls.return_value = []
+        if channel == "email":
+            sender = mocker.patch.object(smtplib, "SMTP")
+        else:
+            sender = mocker.patch.object(Session, "post")
+        result = action.run(checkpoint_result=checkpoint_result)
+        return result, sender
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    @pytest.mark.parametrize(
+        "invalid_value",
+        [
+            pytest.param(-1, id="negative"),
+            pytest.param(1.5, id="non_integer_float"),
+            pytest.param("2", id="string"),
+            pytest.param(True, id="bool"),
+        ],
+    )
+    def test_invalid_min_failed_validations_rejected_at_config_time(
+        self, factory, channel, _key, _not_required, invalid_value
+    ):
+        with pytest.raises(ValidationError):
+            factory(min_failed_validations=invalid_value)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    @pytest.mark.parametrize(
+        "invalid_value",
+        [
+            pytest.param(-0.1, id="negative"),
+            pytest.param(1.1, id="above_one"),
+            pytest.param("0.5", id="string"),
+            pytest.param(True, id="bool"),
+        ],
+    )
+    def test_invalid_min_failed_validation_ratio_rejected_at_config_time(
+        self, factory, channel, _key, _not_required, invalid_value
+    ):
+        with pytest.raises(ValidationError):
+            factory(min_failed_validation_ratio=invalid_value)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    @pytest.mark.parametrize(
+        "min_count, min_ratio",
+        [
+            pytest.param(0, None, id="count_zero"),
+            pytest.param(3, None, id="positive_count"),
+            pytest.param(None, 0.0, id="ratio_zero"),
+            pytest.param(None, 1.0, id="ratio_one"),
+            pytest.param(0, 1, id="both_boundaries"),
+        ],
+    )
+    def test_valid_thresholds_accepted(
+        self, factory, channel, _key, _not_required, min_count, min_ratio
+    ):
+        action = factory(
+            min_failed_validations=min_count,
+            min_failed_validation_ratio=min_ratio,
+        )
+
+        assert action.min_failed_validations == min_count
+        assert action.min_failed_validation_ratio == (
+            float(min_ratio) if min_ratio is not None else None
+        )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    @pytest.mark.parametrize(
+        "min_count, min_ratio, expected_to_notify",
+        [
+            pytest.param(2, None, False, id="count_unmet"),
+            pytest.param(1, None, True, id="count_met_at_boundary"),
+            pytest.param(0, None, True, id="count_zero_always_met"),
+            pytest.param(None, 0.25, True, id="ratio_met_at_boundary"),
+            pytest.param(None, 0.5, False, id="ratio_unmet"),
+            pytest.param(None, 1.0, False, id="ratio_one_requires_all_failures"),
+            pytest.param(1, 0.25, True, id="both_thresholds_met"),
+            pytest.param(1, 0.5, False, id="both_thresholds_ratio_unmet"),
+            pytest.param(2, 0.25, False, id="both_thresholds_count_unmet"),
+        ],
+    )
+    def test_thresholds_gate_notification_on_failed_run(
+        self,
+        mocker: MockerFixture,
+        mock_context,
+        mixed_checkpoint_result_factory,
+        factory,
+        channel,
+        _key,
+        _not_required,
+        min_count,
+        min_ratio,
+        expected_to_notify,
+    ):
+        # 1 of 4 Validation Definitions failed -> failure ratio of exactly 0.25
+        checkpoint_result = mixed_checkpoint_result_factory(num_success=3, num_failed=1)
+        action = factory(
+            notify_on="failure",
+            min_failed_validations=min_count,
+            min_failed_validation_ratio=min_ratio,
+        )
+
+        result, sender = self._run_action(mocker, mock_context, channel, action, checkpoint_result)
+
+        if expected_to_notify:
+            sender.assert_called_once()
+            assert "suppressed" not in result[_key]
+        else:
+            sender.assert_not_called()
+            assert "suppressed" in result[_key]
+            assert "1 of 4 Validation Definition(s) failed" in result[_key]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    def test_threshold_combines_with_notify_on_all(
+        self,
+        mocker: MockerFixture,
+        mock_context,
+        mixed_checkpoint_result_factory,
+        factory,
+        channel,
+        _key,
+        _not_required,
+    ):
+        # notify_on="all" matches, but 1 failure is below the count threshold of 2
+        checkpoint_result = mixed_checkpoint_result_factory(num_success=3, num_failed=1)
+        action = factory(notify_on="all", min_failed_validations=2)
+
+        result, sender = self._run_action(mocker, mock_context, channel, action, checkpoint_result)
+
+        sender.assert_not_called()
+        assert "suppressed" in result[_key]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    @pytest.mark.parametrize("notify_on", ["success", "critical"])
+    def test_notify_on_mismatch_keeps_its_own_distinct_result(
+        self,
+        mocker: MockerFixture,
+        mock_context,
+        mixed_checkpoint_result_factory,
+        factory,
+        channel,
+        _key,
+        _not_required,
+        notify_on: NotifyOn,
+    ):
+        # Even with a threshold configured, a notify_on mismatch short-circuits first and
+        # keeps its pre-existing, distinguishable result
+        checkpoint_result = mixed_checkpoint_result_factory(num_success=3, num_failed=1)
+        action = factory(notify_on=notify_on, min_failed_validations=0)
+
+        result, sender = self._run_action(mocker, mock_context, channel, action, checkpoint_result)
+
+        sender.assert_not_called()
+        assert result[_key] == _not_required
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    def test_threshold_on_successful_run_suppresses_notification(
+        self,
+        mocker: MockerFixture,
+        mock_context,
+        mixed_checkpoint_result_factory,
+        factory,
+        channel,
+        _key,
+        _not_required,
+    ):
+        # 0 of 2 Validation Definitions failed -> ratio 0.0
+        checkpoint_result = mixed_checkpoint_result_factory(num_success=2, num_failed=0)
+
+        suppressed_action = factory(notify_on="all", min_failed_validations=1)
+        suppressed, sender = self._run_action(
+            mocker, mock_context, channel, suppressed_action, checkpoint_result
+        )
+        sender.assert_not_called()
+        assert "suppressed" in suppressed[_key]
+        assert "0 of 2 Validation Definition(s) failed" in suppressed[_key]
+
+        # A zero-ratio threshold is met on an all-success run (boundary is inclusive)
+        boundary_action = factory(notify_on="all", min_failed_validation_ratio=0.0)
+        sent, sender = self._run_action(
+            mocker, mock_context, channel, boundary_action, checkpoint_result
+        )
+        sender.assert_called_once()
+        assert "suppressed" not in sent[_key]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    def test_threshold_counts_validation_definitions_not_expectations(
+        self,
+        mocker: MockerFixture,
+        mock_context,
+        mixed_checkpoint_result_factory,
+        factory,
+        channel,
+        _key,
+        _not_required,
+    ):
+        # 1 failed Validation Definition containing 3 failed Expectations, out of 2 VDs
+        checkpoint_result = mixed_checkpoint_result_factory(
+            num_success=1, num_failed=1, evaluated_expectations_when_failed=3
+        )
+
+        action = factory(notify_on="failure", min_failed_validations=2)
+        result, sender = self._run_action(mocker, mock_context, channel, action, checkpoint_result)
+
+        # Suppressed despite 3 failed Expectations: only 1 Validation Definition failed
+        sender.assert_not_called()
+        assert "suppressed" in result[_key]
+        assert "1 of 2 Validation Definition(s) failed" in result[_key]
+
+        # Ratio is likewise computed over Validation Definitions (1 / 2 = 0.5)
+        at_ratio = factory(notify_on="failure", min_failed_validation_ratio=0.5)
+        result, sender = self._run_action(
+            mocker, mock_context, channel, at_ratio, checkpoint_result
+        )
+        sender.assert_called_once()
+
+        above_ratio = factory(notify_on="failure", min_failed_validation_ratio=0.51)
+        result, sender = self._run_action(
+            mocker, mock_context, channel, above_ratio, checkpoint_result
+        )
+        sender.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("factory, channel, _key, _not_required", _NOTIFICATION_CHANNELS)
+    def test_suppressed_notification_leaves_checkpoint_result_unchanged(
+        self,
+        mocker: MockerFixture,
+        mock_context,
+        mixed_checkpoint_result_factory,
+        factory,
+        channel,
+        _key,
+        _not_required,
+    ):
+        checkpoint_result = mixed_checkpoint_result_factory(num_success=1, num_failed=1)
+        original_run_results = dict(checkpoint_result.run_results)
+        action = factory(notify_on="failure", min_failed_validations=2)
+
+        result, _sender = self._run_action(mocker, mock_context, channel, action, checkpoint_result)
+
+        assert "suppressed" in result[_key]
+        # The Checkpoint's own success state and validation results are untouched
+        assert checkpoint_result.success is False
+        assert checkpoint_result.run_results == original_run_results
+        assert checkpoint_result.describe_dict()["statistics"] == {
+            "evaluated_validations": 2,
+            "success_percent": 50.0,
+            "successful_validations": 1,
+            "unsuccessful_validations": 1,
+        }

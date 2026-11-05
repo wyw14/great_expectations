@@ -259,6 +259,75 @@ def test_a_stamped_action_keeps_its_checkpoints_context_while_another_is_current
     assert stamped._resolve_context().bound is True
 
 
+@pytest.mark.filesystem
+def test_failure_threshold_suppresses_notification_but_not_success_or_data_docs(
+    tmp_path: pathlib.Path, restore_current_context: None, mocker: MockerFixture
+) -> None:
+    """One failed VD of two: the threshold-2 Slack action is suppressed, threshold-1 sends;
+    the Checkpoint still reports failure and Data Docs are still built."""
+    context = gx.get_context(mode="file", project_root_dir=tmp_path)
+    datasource = context.data_sources.add_pandas("datasource")
+    asset = datasource.add_dataframe_asset("asset")
+    batch_definition = asset.add_batch_definition_whole_dataframe("batch_definition")
+
+    passing_suite = context.suites.add(
+        ExpectationSuite(
+            name="passing_suite",
+            expectations=[gxe.ExpectColumnValuesToNotBeNull(column="a")],
+        )
+    )
+    failing_suite = context.suites.add(
+        ExpectationSuite(
+            name="failing_suite",
+            expectations=[gxe.ExpectColumnValuesToBeInSet(column="a", value_set=[99])],
+        )
+    )
+    passing_validation_definition = context.validation_definitions.add(
+        ValidationDefinition(name="passing_vd", data=batch_definition, suite=passing_suite)
+    )
+    failing_validation_definition = context.validation_definitions.add(
+        ValidationDefinition(name="failing_vd", data=batch_definition, suite=failing_suite)
+    )
+    checkpoint = context.checkpoints.add(
+        Checkpoint(
+            name="checkpoint",
+            validation_definitions=[passing_validation_definition, failing_validation_definition],
+            actions=[
+                UpdateDataDocsAction(name="update_data_docs"),
+                SlackNotificationAction(
+                    name="slack_only_when_all_fail",
+                    slack_webhook="http://example.com/all-fail",
+                    notify_on="failure",
+                    min_failed_validations=2,
+                ),
+                SlackNotificationAction(
+                    name="slack_when_any_fails",
+                    slack_webhook="http://example.com/any-fail",
+                    notify_on="failure",
+                    min_failed_validations=1,
+                ),
+            ],
+        )
+    )
+    post = mocker.patch("requests.Session.post")
+
+    result = checkpoint.run(batch_parameters={"dataframe": pd.DataFrame({"a": [1, 2, 3]})})
+
+    # The Checkpoint's success state reflects the failed VD regardless of notification gating
+    assert result.success is False
+    statistics = result.describe_dict()["statistics"]
+    assert statistics["evaluated_validations"] == 2
+    assert statistics["successful_validations"] == 1
+    assert statistics["unsuccessful_validations"] == 1
+
+    # Exactly one Slack action (min_failed_validations=1) sent; the threshold-2 one was suppressed
+    assert post.call_count == 1
+    assert post.call_args.kwargs["url"] == "http://example.com/any-fail"
+
+    # Data Docs are still built for the run despite the suppressed notification
+    assert _index_html(context).exists()
+
+
 @pytest.mark.unit
 class TestDirectRun:
     """An action run outside any Checkpoint resolves through the current context."""

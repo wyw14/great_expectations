@@ -326,8 +326,98 @@ class DataDocsAction(ValidationAction):
         )
 
 
+class NotificationAction(DataDocsAction):
+    """Base class for Actions that send a notification after a Checkpoint run.
+
+    On top of the ``notify_on`` condition, a notification can be gated on how many of the
+    Validation Definitions executed by the Checkpoint failed. Thresholds count Validation
+    Definitions (one entry per run result), never individual Expectations.
+    """
+
+    notify_on: NotifyOn = "all"
+    min_failed_validations: Optional[int] = None
+    min_failed_validation_ratio: Optional[float] = None
+
+    @validator("min_failed_validations", pre=True)
+    def _validate_min_failed_validations(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        # bool is a subclass of int but is never a meaningful failed-validation count
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(  # noqa: TRY003, TRY004 # FIXME CoP
+                "min_failed_validations must be a non-negative integer; it counts the "
+                "number of failed Validation Definitions in the Checkpoint run (not "
+                "individual Expectations)."
+            )
+        if value < 0:
+            raise ValueError(  # noqa: TRY003 # FIXME CoP
+                "min_failed_validations must be greater than or equal to 0."
+            )
+        return value
+
+    @validator("min_failed_validation_ratio", pre=True)
+    def _validate_min_failed_validation_ratio(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        # bool is a subclass of int but is never a meaningful failure ratio
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(  # noqa: TRY003, TRY004 # FIXME CoP
+                "min_failed_validation_ratio must be a number between 0 and 1 (inclusive), "
+                "equal to the number of failed Validation Definitions divided by the total "
+                "number of Validation Definitions executed."
+            )
+        if not 0 <= value <= 1:
+            raise ValueError(  # noqa: TRY003 # FIXME CoP
+                "min_failed_validation_ratio must be between 0 and 1 (inclusive)."
+            )
+        return value
+
+    def _count_failed_validations(self, checkpoint_result: CheckpointResult) -> tuple[int, int]:
+        """Return (failed Validation Definitions, total executed Validation Definitions).
+
+        Each entry in ``run_results`` is one executed Validation Definition. A Checkpoint
+        without any Validation Definitions is rejected before Actions run, and
+        ``CheckpointResult`` itself requires at least one run result, so the total is always
+        at least one here and the failure ratio is never computed over an empty set.
+        """
+        run_results = checkpoint_result.run_results
+        failed_validations = sum(1 for result in run_results.values() if not result.success)
+        return failed_validations, len(run_results)
+
+    def _failure_thresholds_met(self, checkpoint_result: CheckpointResult) -> bool:
+        """Whether the configured failure-count and failure-ratio thresholds are satisfied.
+
+        When both thresholds are configured, both must be met; when only one (or neither)
+        is configured, only the configured one (or neither) is checked. This is independent
+        of ``notify_on`` and must be combined with that condition.
+        """
+        failed_validations, total_validations = self._count_failed_validations(checkpoint_result)
+
+        if (
+            self.min_failed_validations is not None
+            and failed_validations < self.min_failed_validations
+        ):
+            return False
+
+        if self.min_failed_validation_ratio is not None:
+            failed_ratio = failed_validations / total_validations
+            if failed_ratio < self.min_failed_validation_ratio:
+                return False
+
+        return True
+
+    def _failure_threshold_not_met_message(self, checkpoint_result: CheckpointResult) -> str:
+        failed_validations, total_validations = self._count_failed_validations(checkpoint_result)
+        return (
+            "Notification suppressed because the failed-validation threshold was not met: "
+            f"{failed_validations} of {total_validations} Validation Definition(s) failed "
+            f"(min_failed_validations={self.min_failed_validations}, "
+            f"min_failed_validation_ratio={self.min_failed_validation_ratio})."
+        )
+
+
 @public_api
-class SlackNotificationAction(DataDocsAction):
+class SlackNotificationAction(NotificationAction):
     """Sends a Slack notification to a given webhook.
 
     ```yaml
@@ -356,9 +446,11 @@ class SlackNotificationAction(DataDocsAction):
         slack_webhook: The incoming Slack webhook to which to send notification.
         slack_token: Token from Slack app. Used when not using slack_webhook.
         slack_channel: Slack channel to receive notification. Used when not using slack_webhook.
-        notify_on: Specifies validation status that triggers notification. One of "all", "failure", "success".
+        notify_on: Specifies validation status that triggers notification. One of "all", "failure", "success", "info", "warning", "critical".
         notify_with: List of DataDocs site names to display  in Slack messages. Defaults to all.
         show_failed_expectations: Shows a list of failed expectation types.
+        min_failed_validations: Minimum number of failed Validation Definitions in the run required to notify. Must be a non-negative integer; counts Validation Definitions, not individual Expectations. Defaults to no minimum.
+        min_failed_validation_ratio: Minimum ratio (0 to 1, inclusive) of failed to executed Validation Definitions required to notify. Defaults to no minimum.
 
     Examples:
         **renderer:**
@@ -376,7 +468,6 @@ class SlackNotificationAction(DataDocsAction):
     slack_webhook: Optional[Union[ConfigStr, str]] = None
     slack_token: Optional[Union[ConfigStr, str]] = None
     slack_channel: Optional[Union[ConfigStr, str]] = None
-    notify_on: NotifyOn = "all"
     notify_with: Optional[List[str]] = None
     show_failed_expectations: bool = False
     renderer: SlackRenderer = Field(default_factory=SlackRenderer)
@@ -418,6 +509,13 @@ class SlackNotificationAction(DataDocsAction):
 
         if not should_notify(success=success, notify_on=self.notify_on, max_severity=max_severity):
             return result
+
+        if not self._failure_thresholds_met(checkpoint_result):
+            return {
+                "slack_notification_result": self._failure_threshold_not_met_message(
+                    checkpoint_result
+                )
+            }
 
         checkpoint_text_blocks: list[dict] = []
         for (
@@ -584,18 +682,19 @@ class PagerdutyAlertAction(ValidationAction):
 
 
 @public_api
-class MicrosoftTeamsNotificationAction(ValidationAction):
+class MicrosoftTeamsNotificationAction(NotificationAction):
     """Sends a Microsoft Teams notification to a given webhook.
 
     Args:
         teams_webhook: Incoming Microsoft Teams webhook to which to send notifications.
-        notify_on: Specifies validation status that triggers notification. One of "all", "failure", "success".
+        notify_on: Specifies validation status that triggers notification. One of "all", "failure", "success", "info", "warning", "critical".
+        min_failed_validations: Minimum number of failed Validation Definitions in the run required to notify. Must be a non-negative integer; counts Validation Definitions, not individual Expectations. Defaults to no minimum.
+        min_failed_validation_ratio: Minimum ratio (0 to 1, inclusive) of failed to executed Validation Definitions required to notify. Defaults to no minimum.
     """  # noqa: E501 # FIXME CoP
 
     type: Literal["microsoft"] = "microsoft"
 
     teams_webhook: Union[ConfigStr, str]
-    notify_on: NotifyOn = "all"
     renderer: MicrosoftTeamsRenderer = Field(default_factory=MicrosoftTeamsRenderer)
 
     @validator("renderer", pre=True)
@@ -616,6 +715,13 @@ class MicrosoftTeamsNotificationAction(ValidationAction):
 
         if not should_notify(success=success, notify_on=self.notify_on, max_severity=max_severity):
             return {"microsoft_teams_notification_result": None}
+
+        if not self._failure_thresholds_met(checkpoint_result):
+            return {
+                "microsoft_teams_notification_result": self._failure_threshold_not_met_message(
+                    checkpoint_result
+                )
+            }
 
         data_docs_pages = self._get_data_docs_pages_from_prior_action(action_context=action_context)
 
@@ -759,7 +865,7 @@ class OpsgenieAlertAction(ValidationAction):
 
 
 @public_api
-class EmailAction(ValidationAction):
+class EmailAction(NotificationAction):
     """Sends an email to a given list of email addresses.
 
     ```yaml
@@ -796,8 +902,10 @@ class EmailAction(ValidationAction):
         receiver_emails: Email addresses that will receive the email (separated by commas).
         use_tls: Optional. Use of TLS to send the email (using either TLS or SSL is highly recommended).
         use_ssl: Optional. Use of SSL to send the email (using either TLS or SSL is highly recommended).
-        notify_on: "Specifies validation status that triggers notification. One of "all", "failure", "success".
+        notify_on: "Specifies validation status that triggers notification. One of "all", "failure", "success", "info", "warning", "critical".
         notify_with: Optional list of DataDocs site names to display  in Slack messages. Defaults to all.
+        min_failed_validations: Minimum number of failed Validation Definitions in the run required to notify. Must be a non-negative integer; counts Validation Definitions, not individual Expectations. Defaults to no minimum.
+        min_failed_validation_ratio: Minimum ratio (0 to 1, inclusive) of failed to executed Validation Definitions required to notify. Defaults to no minimum.
 
     Examples:
         **renderer:**
@@ -820,7 +928,6 @@ class EmailAction(ValidationAction):
     sender_alias: Optional[Union[ConfigStr, str]] = None
     use_tls: Optional[bool] = None
     use_ssl: Optional[bool] = None
-    notify_on: NotifyOn = "all"
     notify_with: Optional[List[str]] = None
     renderer: EmailRenderer = Field(default_factory=EmailRenderer)
 
@@ -864,6 +971,9 @@ class EmailAction(ValidationAction):
 
         if not should_notify(success=success, notify_on=self.notify_on, max_severity=max_severity):
             return {"email_result": ""}
+
+        if not self._failure_thresholds_met(checkpoint_result):
+            return {"email_result": self._failure_threshold_not_met_message(checkpoint_result)}
 
         title, html = self.renderer.render(checkpoint_result=checkpoint_result)
         config_provider = self._resolve_context().context.config_provider
