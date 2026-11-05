@@ -48,6 +48,7 @@ from great_expectations.exceptions import (
     BatchDefinitionNotAddedError,
     CheckpointNotAddedError,
     CheckpointRelatedResourcesFreshnessError,
+    CheckpointRunValidationDefinitionParameterOverrideError,
     CheckpointRunWithoutValidationDefinitionError,
     ExpectationSuiteNotAddedError,
     ResourceFreshnessError,
@@ -767,6 +768,279 @@ class TestCheckpointResult:
             expectation_parameters=expectation_parameters,
             result_format=ResultFormat.SUMMARY,
             run_id=mock.ANY,
+        )
+
+    @pytest.fixture
+    def two_validation_definitions(
+        self,
+        mock_suite: ExpectationSuite,
+        mock_batch_def: BatchDefinition,
+    ):
+        validation_definition_a = ValidationDefinition(
+            name="my_validation_def_a",
+            id=str(uuid.uuid4()),
+            data=mock_batch_def,
+            suite=mock_suite,
+        )
+        validation_definition_b = ValidationDefinition(
+            name="my_validation_def_b",
+            id=str(uuid.uuid4()),
+            data=mock_batch_def,
+            suite=mock_suite,
+        )
+        run_result_a = ExpectationSuiteValidationResult(
+            success=True,
+            results=[],
+            suite_name=self.suite_name,
+            batch_id="batch-a",
+        )
+        run_result_b = ExpectationSuiteValidationResult(
+            success=True,
+            results=[],
+            suite_name=self.suite_name,
+            batch_id="batch-b",
+        )
+
+        # ``ValidationDefinition.run`` is patched on the class, so both instances share the
+        # one mock; calls are disambiguated by their position in ``call_args_list`` (the
+        # checkpoint runs its definitions in declared order: A then B).
+        with mock.patch.object(
+            ValidationDefinition, "run", side_effect=[run_result_a, run_result_b]
+        ) as run_mock:
+            yield [validation_definition_a, validation_definition_b], run_mock
+
+    @pytest.mark.unit
+    def test_checkpoint_run_merges_per_validation_definition_parameter_overrides(
+        self,
+        two_validation_definitions,
+    ):
+        validation_definitions, run_mock = two_validation_definitions
+        checkpoint = Checkpoint(
+            name=self.checkpoint_name,
+            validation_definitions=validation_definitions,
+        )
+        global_batch_parameters = {"year": 2018, "month": 1}
+        global_expectation_parameters = {"min_value": 0, "max_value": 10}
+        batch_parameters_by_validation_definition = {
+            # Overrides the top-level "month" key; "year" is inherited.
+            "my_validation_def_a": {"month": 4},
+            # Overrides "month" and adds a key absent from the global mapping.
+            "my_validation_def_b": {"month": 5, "day": 15},
+        }
+        expectation_parameters_by_validation_definition = {
+            "my_validation_def_b": {"max_value": 100},
+        }
+
+        with mock.patch.object(
+            Checkpoint, "is_fresh", return_value=CheckpointFreshnessDiagnostics(errors=[])
+        ):
+            result = checkpoint.run(
+                batch_parameters=global_batch_parameters,
+                expectation_parameters=global_expectation_parameters,
+                batch_parameters_by_validation_definition=(
+                    batch_parameters_by_validation_definition
+                ),
+                expectation_parameters_by_validation_definition=(
+                    expectation_parameters_by_validation_definition
+                ),
+            )
+
+        assert len(result.run_results) == 2
+
+        a_kwargs = run_mock.call_args_list[0].kwargs
+        b_kwargs = run_mock.call_args_list[1].kwargs
+        assert a_kwargs["batch_parameters"] == {"year": 2018, "month": 4}
+        assert b_kwargs["batch_parameters"] == {"year": 2018, "month": 5, "day": 15}
+        # No expectation override for A: the global values are inherited verbatim.
+        assert a_kwargs["expectation_parameters"] == {"min_value": 0, "max_value": 10}
+        # B replaces only "max_value"; "min_value" is inherited.
+        assert b_kwargs["expectation_parameters"] == {"min_value": 0, "max_value": 100}
+        # Every result belongs to the same run.
+        assert a_kwargs["run_id"] is b_kwargs["run_id"] is result.run_id
+
+    @pytest.mark.unit
+    def test_checkpoint_run_without_overrides_passes_globals_to_every_definition(
+        self,
+        two_validation_definitions,
+    ):
+        validation_definitions, run_mock = two_validation_definitions
+        checkpoint = Checkpoint(
+            name=self.checkpoint_name,
+            validation_definitions=validation_definitions,
+        )
+        global_batch_parameters = {"year": 2018, "month": 1}
+        global_expectation_parameters = {"max_value": 10}
+
+        with mock.patch.object(
+            Checkpoint, "is_fresh", return_value=CheckpointFreshnessDiagnostics(errors=[])
+        ):
+            checkpoint.run(
+                batch_parameters=global_batch_parameters,
+                expectation_parameters=global_expectation_parameters,
+            )
+
+        assert run_mock.call_count == len(validation_definitions)
+        for call in run_mock.call_args_list:
+            assert call.kwargs["batch_parameters"] == global_batch_parameters
+            assert call.kwargs["expectation_parameters"] == global_expectation_parameters
+
+    @pytest.mark.unit
+    def test_checkpoint_run_parameter_overrides_do_not_mutate_caller_inputs(
+        self,
+        two_validation_definitions,
+    ):
+        validation_definitions, run_mock = two_validation_definitions
+        checkpoint = Checkpoint(
+            name=self.checkpoint_name,
+            validation_definitions=validation_definitions,
+        )
+        global_batch_parameters = {"year": 2018, "month": 1}
+        global_expectation_parameters = {"min_value": 0, "max_value": 10}
+        batch_parameters_by_validation_definition = {
+            "my_validation_def_a": {"month": 4},
+        }
+        expectation_parameters_by_validation_definition = {
+            "my_validation_def_b": {"max_value": 100},
+        }
+
+        with mock.patch.object(
+            Checkpoint, "is_fresh", return_value=CheckpointFreshnessDiagnostics(errors=[])
+        ):
+            checkpoint.run(
+                batch_parameters=global_batch_parameters,
+                expectation_parameters=global_expectation_parameters,
+                batch_parameters_by_validation_definition=(
+                    batch_parameters_by_validation_definition
+                ),
+                expectation_parameters_by_validation_definition=(
+                    expectation_parameters_by_validation_definition
+                ),
+            )
+
+        # The caller's mappings are untouched.
+        assert global_batch_parameters == {"year": 2018, "month": 1}
+        assert global_expectation_parameters == {"min_value": 0, "max_value": 10}
+        assert batch_parameters_by_validation_definition == {"my_validation_def_a": {"month": 4}}
+        assert expectation_parameters_by_validation_definition == {
+            "my_validation_def_b": {"max_value": 100}
+        }
+
+        a_batch_parameters = run_mock.call_args_list[0].kwargs["batch_parameters"]
+        b_batch_parameters = run_mock.call_args_list[1].kwargs["batch_parameters"]
+        # Each definition receives an independent copy rather than a shared/global object.
+        assert a_batch_parameters is not b_batch_parameters
+        assert a_batch_parameters is not global_batch_parameters
+        assert b_batch_parameters is not global_batch_parameters
+
+        # Mutating one definition's parameters cannot leak into another or into the caller.
+        a_batch_parameters["year"] = 9999
+        assert b_batch_parameters["year"] == 2018
+        assert global_batch_parameters["year"] == 2018
+
+    @pytest.mark.unit
+    def test_checkpoint_run_unknown_validation_definition_override_raises_before_running(
+        self,
+        validation_definition: ValidationDefinition,
+        mocker: MockerFixture,
+    ):
+        action = mocker.Mock(spec=UpdateDataDocsAction, type="update_data_docs")
+        checkpoint = Checkpoint(
+            name=self.checkpoint_name,
+            validation_definitions=[validation_definition],
+            actions=[action],
+        )
+
+        with pytest.raises(CheckpointRunValidationDefinitionParameterOverrideError) as e:
+            checkpoint.run(
+                batch_parameters={"year": 2018},
+                batch_parameters_by_validation_definition={"unknown_def": {"month": 1}},
+                expectation_parameters_by_validation_definition={"other_unknown": {"x": 1}},
+            )
+
+        message = str(e.value)
+        # Every unknown key is reported in the single pre-flight error, along with the
+        # names the Checkpoint actually holds.
+        assert "unknown_def" in message
+        assert "other_unknown" in message
+        assert self.validation_definition_name in message
+        # Nothing runs: no validation, no actions, and no freshness/store interaction.
+        validation_definition.run.assert_not_called()  # type: ignore[attr-defined]
+        action._copy_and_set_values().run.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "run_kwargs",
+        [
+            pytest.param(
+                {"batch_parameters_by_validation_definition": ["not", "a", "mapping"]},
+                id="batch_override_outer_not_a_mapping",
+            ),
+            pytest.param(
+                {"expectation_parameters_by_validation_definition": "not-a-mapping"},
+                id="expectation_override_outer_not_a_mapping",
+            ),
+            pytest.param(
+                {
+                    "batch_parameters_by_validation_definition": {
+                        "my_validation_def": "not-a-mapping"
+                    }
+                },
+                id="batch_override_value_not_a_mapping",
+            ),
+            pytest.param(
+                {"expectation_parameters_by_validation_definition": {"my_validation_def": 5}},
+                id="expectation_override_value_not_a_mapping",
+            ),
+        ],
+    )
+    def test_checkpoint_run_invalid_override_mapping_raises_before_running(
+        self,
+        validation_definition: ValidationDefinition,
+        run_kwargs: dict,
+    ):
+        checkpoint = Checkpoint(
+            name=self.checkpoint_name,
+            validation_definitions=[validation_definition],
+        )
+
+        with pytest.raises(CheckpointRunValidationDefinitionParameterOverrideError):
+            checkpoint.run(**run_kwargs)
+
+        validation_definition.run.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.unit
+    def test_checkpoint_run_with_overrides_runs_actions_once_after_all_validations(
+        self,
+        two_validation_definitions,
+        mocker: MockerFixture,
+    ):
+        context = mocker.Mock(spec=AbstractDataContext)
+        set_context(project=context)
+        validation_definitions, run_mock = two_validation_definitions
+        action = mocker.Mock(spec=UpdateDataDocsAction, type="update_data_docs")
+        checkpoint = Checkpoint(
+            name=self.checkpoint_name,
+            validation_definitions=validation_definitions,
+            actions=[action],
+        )
+
+        result = checkpoint.run(
+            batch_parameters={"year": 2018, "month": 1},
+            batch_parameters_by_validation_definition={
+                "my_validation_def_a": {"month": 4},
+                "my_validation_def_b": {"month": 5},
+            },
+        )
+
+        # Both validations completed, exactly once each (each with its own month), and the
+        # single action ran once against the aggregated result.
+        assert run_mock.call_count == 2
+        assert [call.kwargs["batch_parameters"]["month"] for call in run_mock.call_args_list] == [
+            4,
+            5,
+        ]
+        action._copy_and_set_values().run.assert_called_once_with(
+            checkpoint_result=result, action_context=mock.ANY
         )
 
     @pytest.mark.unit

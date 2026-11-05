@@ -55,6 +55,7 @@ from great_expectations.data_context.types.resource_identifiers import (
 from great_expectations.exceptions import (
     CheckpointNotAddedError,
     CheckpointNotFreshError,
+    CheckpointRunValidationDefinitionParameterOverrideError,
     CheckpointRunWithoutValidationDefinitionError,
 )
 from great_expectations.exceptions.exceptions import (
@@ -309,27 +310,60 @@ class Checkpoint(BaseModel):
         batch_parameters: Dict[str, Any] | None = None,
         expectation_parameters: SuiteParameterDict | None = None,
         run_id: RunIdentifier | None = None,
+        batch_parameters_by_validation_definition: Mapping[str, Mapping[str, Any]] | None = None,
+        expectation_parameters_by_validation_definition: Mapping[str, SuiteParameterDict]
+        | None = None,
     ) -> CheckpointResult:
         """
         Runs the Checkpoint's underlying Validation Definitions and Actions.
 
         Args:
-            batch_parameters: Parameters to be used when loading the Batch.
-            expectation_parameters: Parameters to be used when validating the Batch.
+            batch_parameters: Parameters to be used when loading the Batch. These are applied
+                to every Validation Definition in the Checkpoint, except where overridden for
+                a specific definition via ``batch_parameters_by_validation_definition``.
+            expectation_parameters: Parameters to be used when validating the Batch. These are
+                applied to every Validation Definition in the Checkpoint, except where
+                overridden for a specific definition via
+                ``expectation_parameters_by_validation_definition``.
             run_id: An optional unique identifier for the run.
+            batch_parameters_by_validation_definition: An optional mapping of Validation
+                Definition name to batch parameter overrides for that one definition.
+                Overriding is done by top-level key: a key present here replaces the matching
+                key in ``batch_parameters`` for that definition only; every other key is
+                inherited unchanged. Each Validation Definition receives its own independent
+                parameters.
+            expectation_parameters_by_validation_definition: An optional mapping of Validation
+                Definition name to expectation parameter overrides for that one definition.
+                Overriding is done by top-level key: a key present here replaces the matching
+                key in ``expectation_parameters`` for that definition only; every other key is
+                inherited unchanged. Each Validation Definition receives its own independent
+                parameters.
 
         Returns:
-            A CheckpointResult object containing the results of the run.
+            A CheckpointResult object containing the results of the run. All selected
+            Validation Definitions share this single run, and Actions run once after all of
+            them have completed.
 
         Raises:
             CheckpointRunWithoutValidationDefinitionError: If the Checkpoint is run without any
                                                            Validation Definitions.
+            CheckpointRunValidationDefinitionParameterOverrideError: If an override mapping is
+                not a mapping, an override value is not a mapping, or an override is keyed to a
+                Validation Definition name this Checkpoint does not hold. Raised before any
+                Validation Definition is run.
             CheckpointNotAddedError: If the Checkpoint has not been added to the Store.
             CheckpointNotFreshError: If the Checkpoint has been modified since it was last added
                                      to the Store.
         """
         if not self.validation_definitions:
             raise CheckpointRunWithoutValidationDefinitionError()
+
+        self._validate_runtime_parameter_overrides(
+            batch_parameters_by_validation_definition=batch_parameters_by_validation_definition,
+            expectation_parameters_by_validation_definition=(
+                expectation_parameters_by_validation_definition
+            ),
+        )
 
         diagnostics = self.is_fresh()
         if not diagnostics.success:
@@ -339,15 +373,23 @@ class Checkpoint(BaseModel):
             else:
                 diagnostics.raise_for_error()
 
-        if batch_parameters is None:
-            batch_parameters = {}
-        if expectation_parameters is None:
-            expectation_parameters = SuiteParameterDict()
+        # Normalize on copies so that neither the caller's inputs nor this Checkpoint's
+        # persisted configuration can be mutated by context preparation or a validation run.
+        batch_parameters = dict(batch_parameters) if batch_parameters else {}
+        expectation_parameters = (
+            dict(expectation_parameters) if expectation_parameters else SuiteParameterDict()
+        )
         run_id = run_id or RunIdentifier(run_time=dt.datetime.now(dt.timezone.utc))
         self._prepare_checkpoint_run_for_context(batch_parameters, expectation_parameters)
         run_results = self._run_validation_definitions(
             batch_parameters=batch_parameters,
             expectation_parameters=expectation_parameters,
+            batch_parameters_by_validation_definition=(
+                batch_parameters_by_validation_definition or {}
+            ),
+            expectation_parameters_by_validation_definition=(
+                expectation_parameters_by_validation_definition or {}
+            ),
             result_format=self.result_format,
             run_id=run_id,
         )
@@ -375,19 +417,84 @@ class Checkpoint(BaseModel):
         context = self._resolve_context().context
         context.prepare_checkpoint_run(self, batch_parameters, expectation_parameters)
 
-    def _run_validation_definitions(
+    def _validate_runtime_parameter_overrides(
+        self,
+        *,
+        batch_parameters_by_validation_definition: Mapping[str, Mapping[str, Any]] | None,
+        expectation_parameters_by_validation_definition: Mapping[str, SuiteParameterDict] | None,
+    ) -> None:
+        """Validate per-Validation Definition parameter overrides before any validation runs.
+
+        Every override mapping must itself be a mapping, every override value must be a
+        mapping, and every key must name a Validation Definition held by this Checkpoint.
+        All problems found are reported together so the caller can fix them in one pass.
+        """
+        known_names: List[str] = list(dict.fromkeys(vd.name for vd in self.validation_definitions))
+        problems: List[str] = []
+
+        def _check(argument_name: str, overrides: Mapping[str, Mapping[str, Any]] | None) -> None:
+            if overrides is None:
+                return
+            if not isinstance(overrides, Mapping):
+                problems.append(
+                    f"`{argument_name}` must be a mapping keyed by Validation Definition name, "
+                    f"but a {type(overrides).__name__} was provided."
+                )
+                return
+            for name, parameter_override in overrides.items():
+                if not isinstance(parameter_override, Mapping):
+                    problems.append(
+                        f"`{argument_name}[{name!r}]` must be a mapping of parameters, "
+                        f"but a {type(parameter_override).__name__} was provided."
+                    )
+                if name not in known_names:
+                    available = ", ".join(repr(known_name) for known_name in known_names)
+                    available = available or "<none>"
+                    problems.append(
+                        f"`{argument_name}` references an unknown Validation Definition "
+                        f"{name!r}. This Checkpoint contains: {available}."
+                    )
+
+        _check(
+            "batch_parameters_by_validation_definition",
+            batch_parameters_by_validation_definition,
+        )
+        _check(
+            "expectation_parameters_by_validation_definition",
+            expectation_parameters_by_validation_definition,
+        )
+
+        if problems:
+            raise CheckpointRunValidationDefinitionParameterOverrideError(problems)
+
+    def _run_validation_definitions(  # noqa: PLR0913 # FIXME CoP
         self,
         batch_parameters: Dict[str, Any],
         expectation_parameters: SuiteParameterDict,
+        batch_parameters_by_validation_definition: Mapping[str, Mapping[str, Any]],
+        expectation_parameters_by_validation_definition: Mapping[str, SuiteParameterDict],
         result_format: ResultFormatUnion,
         run_id: RunIdentifier,
     ) -> Dict[ValidationResultIdentifier, ExpectationSuiteValidationResult]:
         run_results: Dict[ValidationResultIdentifier, ExpectationSuiteValidationResult] = {}
         for validation_definition in self.validation_definitions:
+            # A fresh shallow merge per definition: override keys replace matching global
+            # keys at the top level, all other keys are inherited, and neither the caller's
+            # mappings nor any sibling definition's parameters are shared/mutated.
+            validation_batch_parameters: Dict[str, Any] = {
+                **batch_parameters,
+                **batch_parameters_by_validation_definition.get(validation_definition.name, {}),
+            }
+            validation_expectation_parameters: SuiteParameterDict = {
+                **expectation_parameters,
+                **expectation_parameters_by_validation_definition.get(
+                    validation_definition.name, {}
+                ),
+            }
             validation_result = validation_definition.run(
                 checkpoint_id=self.id,
-                batch_parameters=batch_parameters,
-                expectation_parameters=expectation_parameters,
+                batch_parameters=validation_batch_parameters,
+                expectation_parameters=validation_expectation_parameters,
                 result_format=result_format,
                 run_id=run_id,
             )

@@ -97,6 +97,23 @@ class CheckpointRunWithoutValidationDefinitionError(CheckpointError):
         )
 
 
+class CheckpointRunValidationDefinitionParameterOverrideError(CheckpointError):
+    """Per-Validation Definition parameter overrides passed to ``Checkpoint.run()`` are
+    structurally invalid or keyed to a Validation Definition the Checkpoint does not hold.
+
+    Raised before any Validation Definition is run.
+    """
+
+    def __init__(self, problems: str | list[str]) -> None:
+        if isinstance(problems, str):
+            problems = [problems]
+        message = (
+            "Invalid per-Validation Definition parameter override(s) passed to "
+            "Checkpoint.run():\n" + "\n".join(f"  - {problem}" for problem in problems)
+        )
+        super().__init__(message)
+
+
 class StoreBackendError(DataContextError):
     pass
 

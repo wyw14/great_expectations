@@ -5,6 +5,7 @@ from .exceptions import (
     BatchSpecError,
     CheckpointError,
     CheckpointNotFoundError,
+    CheckpointRunValidationDefinitionParameterOverrideError,
     CheckpointRunWithoutValidationDefinitionError,
     ClassInstantiationError,
     ConfigNotFoundError,
